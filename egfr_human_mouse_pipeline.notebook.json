@@ -1,0 +1,72 @@
+{
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {"language": "markdown"},
+      "source": ["# EGFR human/mouse minibinder design\n", "\n", "First-stage Colab workflow for paired human/mouse EGFR binder design. Relaxation and pH optimization are deferred."]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {"language": "python"},
+      "source": ["%pip -q install numpy biopython pandas tqdm 'fair-esm[esmfold]' plip\n", "# Optional after the smoke test: clone and install BindCraft in Colab."]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {"language": "python"},
+      "source": ["from pathlib import Path\n", "import sys\n", "PROJECT_ROOT = Path('/content/egfr_design')\n", "REPO_ROOT = PROJECT_ROOT / 'week1'\n", "sys.path.insert(0, str(REPO_ROOT))\n", "from egfr_pipeline.target_prep import TARGETS, domain_iii_window, download_targets, trim_pdb_by_residue_range, validate_target_specs\n", "from egfr_pipeline.bindcraft_stage import build_bindcraft_settings, clear_gpu_memory, gpu_report, write_json_settings\n", "from egfr_pipeline.structural_checks import early_structure_report, aligned_binder_rmsd\n", "from egfr_pipeline.mpnn_stage import PositionConstraint, build_colabdesign_mpnn_options, build_proteinmpnn_jsonl_record, make_histidine_bias, write_constraint_record\n", "from egfr_pipeline.esmfold_stage import clear_esmfold_memory, load_esmfold, screen_complexes_by_target, screen_monomers, write_screening_csv\n", "from egfr_pipeline.plip_stage import parse_plip_targets, run_plip_xml\n", "from egfr_pipeline.colabfold_stage import parse_colabfold_targets\n", "from egfr_pipeline.results import assemble_binder_metric_rows, write_binder_metrics_csv\n", "validate_target_specs()\n", "print(gpu_report())"]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {"language": "python"},
+      "source": ["CAMPAIGN = {'name': 'egfr_human_mouse_stage1', 'binder_lengths': (65, 75), 'target_chain': 'A', 'binder_chain': 'B', 'final_designs': 30, 'relaxation': False, 'ph_optimization': False}\n", "for name, target in TARGETS.items():\n", "    start, end, sequence = domain_iii_window(target)\n", "    print(name, start, end, len(sequence))"]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {"language": "python"},
+      "source": ["RAW_DIR = PROJECT_ROOT / 'raw_targets'\n", "TRIMMED_DIR = PROJECT_ROOT / 'trimmed_targets'\n", "raw_paths = download_targets(RAW_DIR)\n", "PDB_RANGES = {'human': (345, 494), 'mouse': (345, 494)}\n", "trimmed_paths = {}\n", "for name, target in TARGETS.items():\n", "    start, end = PDB_RANGES[name]\n", "    trimmed_paths[name] = trim_pdb_by_residue_range(raw_paths[target.name], TRIMMED_DIR / f'{name}_egfr_domain3.pdb', start, end, 'A')\n", "    print(name, trimmed_paths[name])"]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {"language": "python"},
+      "source": ["settings = build_bindcraft_settings(PROJECT_ROOT / 'outputs' / CAMPAIGN['name'], trimmed_paths['human'], trimmed_paths['mouse'], CAMPAIGN['name'], CAMPAIGN['binder_lengths'], CAMPAIGN['final_designs'])\n", "settings_path = write_json_settings(settings, PROJECT_ROOT / 'settings' / f\"{CAMPAIGN['name']}.json\")\n", "print(settings_path)"]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {"language": "python"},
+      "source": ["def check_generated_complexes(complex_dir):\n", "    return [early_structure_report(path, 'A', 'B') for path in sorted(Path(complex_dir).glob('*.pdb'))]\n", "# reports = check_generated_complexes(PROJECT_ROOT / 'outputs' / CAMPAIGN['name'] / 'Trajectory')\n", "clear_gpu_memory()"]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {"language": "markdown"},
+      "source": ["## 7. ProteinMPNN redesign and positional controls\n", "\n", "ProteinMPNN can steer positions in three distinct ways. `fixed=True` preserves the backbone residue and is the strongest constraint. `allowed_aas='HDE'` restricts sampling to a set. `bias={'H': 1.5}` increases the probability of histidine without forcing it. Positions below are **1-based and chain-local on binder chain B**, not PDB residue numbers and not zero-based Python indexes.\n", "\n", "For pH experiments, start with soft histidine biasing and compare multiple strengths. This is a sequence-sampling preference, not a pKa or affinity prediction."]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {"language": "python"},
+      "source": ["# Example: exploratory pH-oriented redesign. Replace positions after inspecting the interface.\n", "BINDER_LENGTH = 70\n", "constraints = [\n", "    make_histidine_bias(position=12, strength=1.5, label='candidate_pH_site'),\n", "    PositionConstraint(position=28, allowed_aas='DEH', label='acidic_or_histidine_site'),\n", "    # PositionConstraint(position=41, fixed=True, label='preserve_interface_residue'),\n", "]\n", "mpnn_options = build_colabdesign_mpnn_options(BINDER_LENGTH, constraints, omit_aas='C')\n", "print(mpnn_options)\n", "constraint_record = build_proteinmpnn_jsonl_record('A' * BINDER_LENGTH, constraints)\n", "write_constraint_record(constraint_record, PROJECT_ROOT / 'settings' / 'mpnn_constraints_example.json')\n", "print('Saved an auditable constraint record. Apply these controls in the ProteinMPNN wrapper used by the installed ColabDesign version.')"]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {"language": "markdown"},
+      "source": ["## 8. ESMFold monomer-first validation\n", "\n", "Run ESMFold on binder sequences alone first. Only monomers with binder pLDDT >= 75 continue to complex screening. ESMFold pLDDT is a plausibility filter, not an affinity measurement. The model's pTM is not exposed consistently by all fair-esm versions, so this helper records it as unavailable rather than inventing a value."]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {"language": "python"},
+      "source": ["# designs = [{'design_id': 'd001', 'sequence': '...'}, ...]\n", "# esm_model = load_esmfold(chunk_size=64)\n", "# monomer_pass = screen_monomers(esm_model, designs, PROJECT_ROOT / 'esmfold' / 'monomers', minimum_binder_plddt=75.0)\n", "# clear_esmfold_memory()\n", "# trimmed_targets = {name: domain_iii_window(target)[2] for name, target in TARGETS.items()}\n", "# complex_results = screen_complexes_by_target(esm_model, monomer_pass, trimmed_targets, PROJECT_ROOT / 'esmfold' / 'complexes', separator_mode='colon')\n", "# write_screening_csv(complex_results, PROJECT_ROOT / 'esmfold' / 'complex_screening.csv')\n", "# clear_esmfold_memory()\n", "# Each monomer-passing binder receives one human and one mouse complex prediction.\n", "# If the installed ESMFold wrapper rejects ':', rerun with separator_mode='glycine'. This fallback is only a heuristic because a G-linker is not a true chain break."]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {"language": "markdown"},
+      "source": ["## ColabFold interface scores\n", "\n", "Parse the human and mouse ColabFold score JSON files to retrieve ipTM, ipSAE, pDockQ, and pDockQ2. These metrics come from ColabFold, not ESMFold.\n", "\n", "# colabfold_score_jsons = {'d001': {'human': '/content/.../human_scores.json', 'mouse': '/content/.../mouse_scores.json'}}\n", "# colabfold_metrics = {design_id: parse_colabfold_targets(paths, chain_pair='A-B') for design_id, paths in colabfold_score_jsons.items()}\n", "# final_rows = assemble_binder_metric_rows(designs, complex_results=complex_results, colabfold_metrics=colabfold_metrics)\n", "# write_binder_metrics_csv(final_rows, PROJECT_ROOT / 'outputs' / CAMPAIGN['name'] / 'binder_metrics.csv')"]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {"language": "markdown"},
+      "source": ["## Next stage\n", "\n", "Run a 2-5 trajectory BindCraft multi-template smoke test, export MPNN sequences, then execute the monomer-first ESMFold screen and ColabFold complex validation. Do not enable relaxation in this campaign. Keep the top approximately 30 complex candidates for later AlphaFold Server evaluation of ipTM and PAE."]
+    }
+  ],
+  "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}, "language_info": {"name": "python"}},
+  "nbformat": 4,
+  "nbformat_minor": 5
+}
