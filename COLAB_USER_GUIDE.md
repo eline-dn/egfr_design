@@ -2,7 +2,7 @@
 
 This guide runs the current EGFR human/mouse minibinder workflow with Google Colab and Google Drive persistence.
 
-The guide is intentionally honest about the current state: the repository contains the target preparation, ProteinMPNN constraint, ESMFold, PLIP, RMSD, and CSV helpers, but the upstream BindCraft design engine is not yet launched automatically by the notebook. The BindCraft smoke test is therefore a required handoff step.
+The guide runs direct ColabDesign binder hallucination. The referenced BindCraft notebook is used only as a methodological reference; BindCraft itself is not installed or executed.
 
 ## 0. What this run is trying to produce
 
@@ -36,7 +36,7 @@ if torch.cuda.is_available():
     print(torch.cuda.get_device_name(0))
 ```
 
-If this prints `False`, stop and change the runtime before loading ESMFold or BindCraft.
+If this prints `False`, stop and change the runtime before loading ESMFold or ColabDesign.
 
 ## 2. Mount Google Drive
 
@@ -104,6 +104,7 @@ The package should contain:
 egfr_pipeline/
     target_prep.py
     bindcraft_stage.py
+    colabdesign_stage.py
     mpnn_stage.py
     esmfold_stage.py
     structural_checks.py
@@ -120,6 +121,7 @@ Run this in a notebook code cell:
 
 ```python
 %pip -q install numpy biopython pandas tqdm 'fair-esm[esmfold]' plip
+%pip -q install git+https://github.com/sokrypton/ColabDesign.git
 ```
 
 Restart the Colab runtime if the installation reports that PyTorch, OpenFold, or JAX was already imported with incompatible versions. After restarting, remount Drive and rerun the repository setup cell.
@@ -128,7 +130,8 @@ Check the project imports:
 
 ```python
 from egfr_pipeline.target_prep import TARGETS, validate_target_specs
-from egfr_pipeline.bindcraft_stage import gpu_report, bindcraft_import_check
+from egfr_pipeline.bindcraft_stage import gpu_report
+from egfr_pipeline.colabdesign_stage import generate_shared_binder
 from egfr_pipeline.mpnn_stage import PositionConstraint, make_histidine_bias
 from egfr_pipeline.esmfold_stage import load_esmfold
 from egfr_pipeline.plip_stage import parse_plip_xml, run_plip_xml
@@ -136,22 +139,21 @@ from egfr_pipeline.results import assemble_binder_metric_rows, write_binder_metr
 
 validate_target_specs()
 print(gpu_report())
-print(bindcraft_import_check())
+print('Direct ColabDesign helper:', generate_shared_binder.__name__)
 ```
 
-`colabdesign` may still show as missing at this point. That is expected until BindCraft/ColabDesign is installed.
+ColabDesign should now import successfully. AlphaFold parameter files are still required for generation.
 
-## 5. Install BindCraft and its large dependencies
+## 5. Prepare ColabDesign AlphaFold parameters
 
-The current code writes a BindCraft configuration but does not replace the upstream BindCraft engine. Clone BindCraft separately:
+The direct helper uses `mk_af_model(protocol="binder", use_multimer=True)` and requires AlphaFold parameter files:
 
 ```python
-BINDCRAFT_DIR = Path('/content/BindCraft')
-if not BINDCRAFT_DIR.exists():
-    !git clone --depth 1 https://github.com/martinpacesa/BindCraft.git "$BINDCRAFT_DIR"
+AF_PARAMS_DIR = Path('/content/egfr_design/params')
+AF_PARAMS_DIR.mkdir(parents=True, exist_ok=True)
 ```
 
-Follow the upstream installation instructions for the current Colab-compatible revision. The exact CUDA, conda, AlphaFold parameter, DSSP, DAlphaBall, and PyRosetta requirements can change. Do not assume that a local installation command from an older BindCraft commit still works unchanged.
+Populate `AF_PARAMS_DIR` with the ColabDesign-compatible AlphaFold parameters. They are several GB and can be stored on persistent Drive storage.
 
 The upstream workflow requires, at minimum:
 
@@ -159,10 +161,9 @@ The upstream workflow requires, at minimum:
 - ColabDesign and JAX;
 - AlphaFold parameter files, which are several GB;
 - ProteinMPNN weights;
-- DSSP and DAlphaBall binaries;
-- PyRosetta for the standard BindCraft relaxation/interface-scoring path.
+- no PyRosetta, DSSP, or DAlphaBall for this relaxation-free direct-design stage.
 
-For this project, leave relaxation disabled where possible. PyRosetta is not required by the helper-only stages, but the original BindCraft pipeline may still import or require it during setup. Check its licensing terms before use.
+Relaxation remains disabled in this campaign.
 
 After installation, verify the environment before a long run:
 
@@ -189,8 +190,8 @@ Run the notebook sections in this order:
 2. Import project helpers.
 3. Define the paired human/mouse campaign.
 4. Download and trim targets.
-5. Write BindCraft multi-template settings.
-6. Run early structural checks on generated PDBs.
+5. Prepare `AF_PARAMS_DIR` and run direct ColabDesign hallucination.
+6. Run early structural checks on generated ColabDesign PDBs.
 7. Define ProteinMPNN constraints if needed.
 8. Run monomer-first ESMFold.
 9. Run human and mouse complex ESMFold.
@@ -246,52 +247,53 @@ for name, target in TARGETS.items():
 
 Open the two trimmed PDBs in a viewer or inspect them in PyMOL/ChimeraX. Confirm that they show the same functional domain and that the target chain remains `A`.
 
-## 8. Write the shared human/mouse BindCraft settings
+## 8. Run direct ColabDesign binder hallucination
 
 ```python
-from egfr_pipeline.bindcraft_stage import build_bindcraft_settings, write_json_settings
+from egfr_pipeline.colabdesign_stage import HallucinationConfig, generate_shared_binder
 
-settings = build_bindcraft_settings(
-    output_dir=DRIVE_ROOT / 'outputs' / 'egfr_human_mouse_stage1',
-    human_pdb=trimmed_paths['human'],
-    mouse_pdb=trimmed_paths['mouse'],
-    binder_name='egfr_human_mouse_stage1',
-    binder_lengths=(65, 75),
-    final_designs=30,
+generation = generate_shared_binder(
+    template_pdbs={
+        'human': trimmed_paths['human'],
+        'mouse': trimmed_paths['mouse'],
+    },
+    output_dir=DRIVE_ROOT / 'outputs' / 'egfr_human_mouse_stage1' / 'colabdesign',
+    af_params_dir=AF_PARAMS_DIR,
+    config=HallucinationConfig(
+        binder_length=70,
+        iterations_logits=40,
+        iterations_soft=30,
+        iterations_hard=10,
+        num_recycles=1,
+    ),
+    seed=17,
+    verbose=True,
 )
 
-settings_path = write_json_settings(
-    settings,
-    DRIVE_ROOT / 'settings' / 'egfr_human_mouse_stage1.json',
-)
-print(settings_path)
+designs = [{
+    'design_id': 'egfr_human_mouse_stage1_colabdesign_seed17',
+    'sequence': generation['sequence'],
+    'source': 'direct_colabdesign_hallucination',
+    'colabdesign_human_plddt': generation.get('human_plddt'),
+    'colabdesign_mouse_plddt': generation.get('mouse_plddt'),
+    'colabdesign_human_iptm': generation.get('human_iptm'),
+    'colabdesign_mouse_iptm': generation.get('mouse_iptm'),
+}]
+print('Generated binder length:', len(designs[0]['sequence']))
+print('Trajectory PDBs:', generation['trajectory_pdbs'])
+colabdesign_metrics = {designs[0]['design_id']: generation}
 ```
 
-The two templates are both marked `target`. This means the intended result is one sequence that works against both human and mouse EGFR, not separate species-specific sequences.
+This is the actual backbone/interface generation stage. One shared binder sequence is optimized against both target batches. The output PDBs are the direct structural inputs for ProteinMPNN.
 
-## 9. Run a BindCraft smoke test before production
+Start with one seed and short iteration counts. Increase the number of seeds only after confirming that both trajectory PDBs and one shared sequence are produced.
 
-Do not immediately request 30 accepted designs. Start with 2-5 trajectories.
-
-Use the upstream BindCraft multi-template notebook or the corresponding Python entry point. Point it to:
-
-- the generated settings JSON;
-- the trimmed human PDB;
-- the trimmed mouse PDB;
-- the AlphaFold parameter directory;
-- the ProteinMPNN weights;
-- the output directory on Drive or local Colab storage.
-
-Confirm that the smoke test creates:
+Confirm that the direct run creates:
 
 ```text
-Trajectory/
-Trajectory/Relaxed/       # may remain empty when relaxation is disabled
-MPNN/
-MPNN/Sequences/
-Accepted/
-Rejected/
-*.csv
+colabdesign/
+    shared_binder_human.pdb
+    shared_binder_mouse.pdb
 ```
 
 Inspect at least one generated complex:
@@ -300,7 +302,7 @@ Inspect at least one generated complex:
 from egfr_pipeline.structural_checks import early_structure_report
 
 report = early_structure_report(
-    '/content/egfr_design/outputs/egfr_human_mouse_stage1/Trajectory/example.pdb',
+    generation['trajectory_pdbs']['human'],
     target_chain='A',
     binder_chain='B',
 )
@@ -309,9 +311,9 @@ print(report)
 
 Reject obvious structures with zero interface contacts or heavy-atom clashes. These are triage checks, not affinity predictions.
 
-## 10. Export ProteinMPNN sequences
+## 10. Run ProteinMPNN redesign
 
-Collect the MPNN sequences into a Python list or CSV with at least:
+The current helper documents and validates positional constraints, but the exact ProteinMPNN execution wrapper depends on the installed ColabDesign/ProteinMPNN version. Use the generated trajectory PDBs as the backbone input, then collect the redesigned sequences into a Python list or CSV with at least:
 
 ```python
 designs = [
@@ -409,15 +411,15 @@ print('PLIP XML generated')
 
 PLIP interaction counts are separated by species and include hydrogen bonds, hydrophobic contacts, salt bridges, pi interactions, halogen bonds, water bridges, and metal complexes where chain labels are available.
 
-## 14. Compare ESMFold complexes to initial BindCraft complexes
+## 14. Compare ESMFold complexes to initial ColabDesign complexes
 
 Create a map to the initial complex PDBs:
 
 ```python
 reference_complexes = {
     'egfr_human_mouse_stage1_l70_s123': {
-        'human': DRIVE_ROOT / 'outputs' / 'egfr_human_mouse_stage1' / 'initial_human.pdb',
-        'mouse': DRIVE_ROOT / 'outputs' / 'egfr_human_mouse_stage1' / 'initial_mouse.pdb',
+        'human': DRIVE_ROOT / 'outputs' / 'egfr_human_mouse_stage1' / 'colabdesign' / 'shared_binder_human.pdb',
+        'mouse': DRIVE_ROOT / 'outputs' / 'egfr_human_mouse_stage1' / 'colabdesign' / 'shared_binder_mouse.pdb',
     },
 }
 ```
@@ -449,14 +451,14 @@ The parser selects the `A-B` target-binder pair when interface metrics are store
 
 ## 16. Write the final one-row-per-binder CSV
 
-Provide optional metric maps from BindCraft, structural checks, MPNN, and monomer ESMFold. The aggregator preserves missing values rather than deleting candidates:
+Provide optional metric maps from ColabDesign, structural checks, MPNN, and monomer ESMFold. The aggregator preserves missing values rather than deleting candidates:
 
 ```python
 from egfr_pipeline.results import assemble_binder_metric_rows, write_binder_metrics_csv
 
 final_rows = assemble_binder_metric_rows(
     designs=designs,
-    bindcraft_metrics=bindcraft_metrics,
+    bindcraft_metrics=colabdesign_metrics,
     structural_metrics=structural_metrics,
     mpnn_metrics=mpnn_metrics,
     monomer_metrics=monomer_metrics,
@@ -548,7 +550,7 @@ sys.path.insert(0, '/content/egfr_design/week1')
 
 ### CUDA is unavailable
 
-Reconnect or change the runtime to GPU. Do not proceed with ESMFold or BindCraft on CPU.
+Reconnect or change the runtime to GPU. Do not proceed with ColabDesign or ESMFold on CPU.
 
 ### Out-of-memory errors
 
@@ -579,6 +581,6 @@ Check that both reference and ESMFold PDBs contain:
 - chain IDs A and B;
 - compatible residue numbering.
 
-### BindCraft installation fails
+### ColabDesign installation fails
 
-Use the upstream BindCraft notebook and installation instructions for a compatible commit. Colab CUDA/JAX/PyRosetta compatibility changes over time. Start with a fresh runtime rather than repeatedly mixing package versions.
+Start with a fresh runtime and install the pinned/current ColabDesign checkout before importing JAX. Confirm that `jax.devices()` reports a GPU and that `from colabdesign import mk_af_model` succeeds. AlphaFold parameter files must also be present under `AF_PARAMS_DIR`.

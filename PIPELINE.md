@@ -16,7 +16,8 @@ The contest itself ranks pH selectivity first, mouse cross-reactivity second, an
 
 - [egfr_human_mouse_pipeline.ipynb](egfr_human_mouse_pipeline.ipynb): interactive Colab notebook.
 - [egfr_pipeline/target_prep.py](egfr_pipeline/target_prep.py): target definitions, downloads, sequence windows, and PDB trimming.
-- [egfr_pipeline/bindcraft_stage.py](egfr_pipeline/bindcraft_stage.py): GPU checks, memory cleanup, and multi-template settings generation.
+- [egfr_pipeline/colabdesign_stage.py](egfr_pipeline/colabdesign_stage.py): direct ColabDesign binder hallucination against both EGFR templates.
+- [egfr_pipeline/bindcraft_stage.py](egfr_pipeline/bindcraft_stage.py): shared GPU memory cleanup utilities.
 - [egfr_pipeline/mpnn_stage.py](egfr_pipeline/mpnn_stage.py): auditable ProteinMPNN positional constraints.
 - [egfr_pipeline/esmfold_stage.py](egfr_pipeline/esmfold_stage.py): monomer-first ESMFold screening and human/mouse complex screening.
 - [egfr_pipeline/structural_checks.py](egfr_pipeline/structural_checks.py): contacts, clashes, and target-aligned binder RMSD.
@@ -28,7 +29,7 @@ The contest itself ranks pH selectivity first, mouse cross-reactivity second, an
 
 ### 1. Start a Colab GPU runtime
 
-The notebook installs lightweight dependencies and checks CUDA. BindCraft, ColabDesign, ESMFold, and their weights are not all installed by the local helper package. The first Colab run should be a smoke test with only a few trajectories.
+The notebook installs ColabDesign plus lightweight validation dependencies and checks CUDA. AlphaFold parameters are supplied separately. The first Colab run should be a smoke test with one or a few random seeds.
 
 The repository code must be available under `/content/egfr_design/week1`, or `REPO_ROOT` in the notebook must be changed to the uploaded repository location.
 
@@ -41,24 +42,23 @@ The target helper stores the supplied human and mouse ectodomain sequences and d
 
 The design window is intended to be 150 residues around domain III. The current notebook uses explicit PDB ranges `345-494` for both structures. These ranges must be inspected in the downloaded files before a production run. AlphaFold DB author numbering may not match UniProt numbering, and the current code does not perform an automatic sequence-to-structure alignment.
 
-### 3. Generate the multi-template design configuration
+### 3. Run direct ColabDesign binder hallucination
 
-`build_bindcraft_settings()` creates one human template and one mouse template, both with `target` strategy. Conceptually, this asks a BindCraft/ColabDesign multi-template run to optimize one binder sequence against both structures.
+`generate_shared_binder()` creates a ColabDesign model with `mk_af_model(protocol="binder", use_multimer=True)`. It prepares a separate target batch for human and mouse EGFR, then optimizes one shared binder sequence against both batches.
 
 The intended binder range is 65-75 residues, within the contest's allowed 40-90 residue range.
 
-### 4. Run backbone/interface generation
+At every optimization step it restores the human batch, runs differentiable AF2, restores the mouse batch, runs differentiable AF2, and averages the two sequence gradients. The optimization is annealed through logits, softmax, and hard one-hot stages. The returned per-target PDBs are the direct inputs to ProteinMPNN.
 
-The intended design engine is the referenced BindCraft multi-template notebook. It uses ColabDesign/AlphaFold-style differentiable hallucination and ProteinMPNN, rather than RFdiffusion.
+### 4. Continue with ProteinMPNN redesign
 
-The current repository writes configuration but does not launch the BindCraft engine. A Colab adapter still needs to connect the generated settings to the installed BindCraft notebook or its Python entry point. Relaxation should remain disabled for this campaign.
-
-The first run should generate 2-5 trajectories and verify:
+The first direct-design smoke test should generate a small number of seeds and verify:
 
 - both templates load;
 - target chain A exists;
 - binder chain B is produced;
-- output PDBs and CSVs are written;
+- one shared human/mouse sequence is returned;
+- human and mouse trajectory PDBs are written;
 - memory is released between model stages.
 
 ### 5. ProteinMPNN redesign
@@ -166,7 +166,7 @@ The reference and predicted structures must use compatible residue numbering, ch
 
 - `design_id`;
 - `sequence` and sequence length;
-- BindCraft pLDDT, pTM, ipTM, PAE, interface metrics when present;
+- ColabDesign pLDDT and ipTM metrics from the direct hallucination stage when present;
 - early contacts, clashes, and pass/fail flags;
 - ProteinMPNN score/recovery or constraint metadata when supplied;
 - monomer ESMFold pLDDT/pTM;
@@ -197,10 +197,10 @@ outputs/egfr_human_mouse_stage1/binder_metrics.csv
 | Original goal | Current status | Assessment |
 |---|---|---|
 | Design human EGFR binders | Partial | Human template/configuration and validation plumbing exist; no production campaign has run. |
-| Design human/mouse cross-reactive binders | Partial | Multi-template configuration and dual-target ESMFold/PLIP analysis exist; the BindCraft engine invocation is not connected. |
+| Design human/mouse cross-reactive binders | Partial | Direct ColabDesign multi-template hallucination and dual-target validation are implemented, but no Colab run has been completed here. |
 | Target functional domain III | Partial | Domain-III-centered sequence window is planned, but structure numbering and epitope geometry require manual verification. |
 | Binder length 40-90 aa | Implemented for first campaign | The first settings restrict designs to 65-75 aa. |
-| RFdiffusion backbone generation | Not implemented | The code uses BindCraft/ColabDesign-style configuration; no RFdiffusion model or runner is included. |
+| RFdiffusion backbone generation | Not used | This pipeline deliberately uses direct ColabDesign hallucination instead of RFdiffusion or BindCraft. |
 | ProteinMPNN redesign | Partial | Constraint representation and audit records exist; actual wrapper execution is not yet unified across installations. |
 | Monomer ESMFold filtering | Implemented as helper/notebook hook | Requires Colab GPU, installed ESMFold, and MPNN output files. |
 | Human and mouse complex validation | Implemented as helper/notebook hook | Runs both targets, but has not been executed in this workspace. |
@@ -213,17 +213,17 @@ outputs/egfr_human_mouse_stage1/binder_metrics.csv
 
 ## Limitations and criticism
 
-### The most important limitation: this is not yet a complete generator
+### The most important limitation: the generator has not been run here
 
-The repository currently provides configuration, adapters, metrics, and notebook hooks. It has not produced a validated set of EGFR binders. The notebook summary shows that no cells have been executed. A successful Python compile or mock test only proves plumbing, not biological usefulness.
+The direct generator now exists, but it has not produced a validated set of EGFR binders in this workspace. A successful Python compile or mock test only proves code integrity, not biological usefulness.
 
-### RFdiffusion requirement is unmet
+### RFdiffusion is intentionally replaced
 
-The original tools document explicitly asks for RFdiffusion backbone generation. The current approach instead assumes BindCraft/ColabDesign hallucination. That is a reasonable low-cost alternative, but it is a different algorithm and should be reported as such. No RFdiffusion checkpoint, inference call, or backbone sampling code is present.
+The original tools document asks for RFdiffusion, but this implementation uses ColabDesign binder hallucination directly to keep the human/mouse gradient objective controllable in one notebook. This is a deliberate algorithmic substitution.
 
-### BindCraft integration is incomplete
+### Direct ColabDesign depends on version-sensitive internals
 
-The generated settings are not sufficient evidence that the original `Multi_BC_Original.ipynb` will run unchanged. BindCraft expects particular settings keys, weights, binaries, AlphaFold parameters, and PyRosetta-related components. The current notebook does not yet launch its engine or prove compatibility with the current Colab environment.
+The multi-template gradient combiner uses ColabDesign optimizer internals such as `_params`, `_state`, `_optimizer`, `_inputs`, and `aux["grad"]`. These are practical for reproducing the referenced method, but can change between ColabDesign versions. The smoke test should pin and record the installed commit.
 
 ### Target trimming is fragile
 
@@ -260,11 +260,11 @@ The contest's primary ranking criterion is binding at pH 6.5 but not pH 7.4. His
 ## Recommended next work
 
 1. Validate human and mouse PDB numbering and automate sequence-to-structure mapping.
-2. Run a 2-5 trajectory BindCraft smoke test in Colab.
-3. Connect actual ProteinMPNN sampling and save per-sequence score/recovery fields.
-4. Execute monomer and both complex ESMFold screens on a small batch.
-5. Generate PLIP XML fixtures and verify every interaction category against the installed PLIP version.
-6. Produce the final one-row-per-binder CSV and inspect missing metrics.
-7. Add independent full-ectodomain validation before selecting candidates.
-8. Develop a separate pH-candidate campaign with multiple histidine placements and experimental prioritization.
-9. Send approximately the top 30 diverse candidates to AlphaFold Server for ipTM/PAE review and experimental testing.
+1. Run a one-seed direct ColabDesign smoke test in Colab.
+2. Connect actual ProteinMPNN sampling and save per-sequence score/recovery fields.
+3. Execute monomer and both complex ESMFold screens on a small batch.
+4. Generate PLIP XML fixtures and verify every interaction category against the installed PLIP version.
+5. Produce the final one-row-per-binder CSV and inspect missing metrics.
+6. Add independent full-ectodomain validation before selecting candidates.
+7. Develop a separate pH-candidate campaign with multiple histidine placements and experimental prioritization.
+8. Send approximately the top 30 diverse candidates to AlphaFold Server for ipTM/PAE review and experimental testing.
